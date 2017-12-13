@@ -29,6 +29,7 @@ var (
 	_ StmtNode = &AlterUserStmt{}
 	_ StmtNode = &BeginStmt{}
 	_ StmtNode = &BinlogStmt{}
+	_ StmtNode = &SavePointStmt{}
 	_ StmtNode = &CommitStmt{}
 	_ StmtNode = &CreateUserStmt{}
 	_ StmtNode = &DeallocateStmt{}
@@ -219,6 +220,21 @@ func (n *BinlogStmt) Accept(v Visitor) (Node, bool) {
 		return v.Leave(newNode)
 	}
 	n = newNode.(*BinlogStmt)
+	return v.Leave(n)
+}
+
+type SavePointStmt struct {
+	stmtNode
+	Str string
+}
+
+// Accept implements Node Accept interface.
+func (n *SavePointStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*SavePointStmt)
 	return v.Leave(n)
 }
 
