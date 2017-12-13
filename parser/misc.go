@@ -398,6 +398,7 @@ var tokenMap = map[string]int{
 	"ROW_COUNT":                rowCount,
 	"ROW_FORMAT":               rowFormat,
 	"SAVEPOINT":                savepoint,
+	"RELEASE":                  release,
 	"SCHEMA":                   database,
 	"SCHEMAS":                  databases,
 	"SECOND":                   second,

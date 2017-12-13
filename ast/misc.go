@@ -30,6 +30,8 @@ var (
 	_ StmtNode = &BeginStmt{}
 	_ StmtNode = &BinlogStmt{}
 	_ StmtNode = &SavePointStmt{}
+	_ StmtNode = &ReleaseSavePointStmt{}
+	_ StmtNode = &RollbackToSavePointStmt{}
 	_ StmtNode = &CommitStmt{}
 	_ StmtNode = &CreateUserStmt{}
 	_ StmtNode = &DeallocateStmt{}
@@ -235,6 +237,36 @@ func (n *SavePointStmt) Accept(v Visitor) (Node, bool) {
 		return v.Leave(newNode)
 	}
 	n = newNode.(*SavePointStmt)
+	return v.Leave(n)
+}
+
+type ReleaseSavePointStmt struct {
+	stmtNode
+	Str string
+}
+
+// Accept implements Node Accept interface.
+func (n *ReleaseSavePointStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*ReleaseSavePointStmt)
+	return v.Leave(n)
+}
+
+type RollbackToSavePointStmt struct {
+	stmtNode
+	Str string
+}
+
+// Accept implements Node Accept interface.
+func (n *RollbackToSavePointStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*RollbackToSavePointStmt)
 	return v.Leave(n)
 }
 

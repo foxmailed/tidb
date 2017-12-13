@@ -426,7 +426,7 @@ import (
 	tidbSMJ		"TIDB_SMJ"
 	tidbINLJ	"TIDB_INLJ"
 	savepoint "SAVEPOINT"
-
+	release "RELEASE"
 	builtinAddDate
 	builtinBitAnd
 	builtinBitOr
@@ -534,6 +534,8 @@ import (
 	LockTablesStmt			"Lock tables statement"
 	PreparedStmt			"PreparedStmt"
 	SavePointStmt "SavePointStmt"
+	RollbackToSavePointStmt "RollbackToSavePointStmt"
+	ReleaseSavePointStmt "ReleaseSavePointStmt"
 	SelectStmt			"SELECT statement"
 	RenameTableStmt         	"rename table statement"
 	ReplaceIntoStmt			"REPLACE INTO statement"
@@ -3887,6 +3889,16 @@ SavePointStmt:
     {
         $$ = &ast.SavePointStmt{}
     }
+RollbackToSavePointStmt:
+    "ROLLBACK" "TO" "SAVEPOINT" Identifier
+    {
+        $$ = &ast.RollbackToSavePointStmt{}
+    }
+ReleaseSavePointStmt:
+    "RELEASE" "SAVEPOINT" Identifier
+    {
+        $$ = &ast.ReleaseSavePointStmt{}
+    }
 SelectStmt:
 	"SELECT" SelectStmtOpts SelectStmtFieldList SelectStmtLimit SelectLockOpt
 	{
@@ -5115,6 +5127,8 @@ Statement:
 |	RevokeStmt
 |	SelectStmt
 |   SavePointStmt
+|   ReleaseSavePointStmt
+|   RollbackToSavePointStmt
 |	UnionStmt
 |	SetStmt
 |	ShowStmt
