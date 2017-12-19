@@ -775,6 +775,7 @@ import (
 %type	<ident>
 	KeyOrIndex		"{KEY|INDEX}"
 	ColumnKeywordOpt	"Column keyword or empty"
+	CascadeOpt	"CASCADE or empty"
 	PrimaryOpt		"Optional primary keyword"
 	NowSym			"CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP"
 	NowSymFunc		"CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP/NOW"
@@ -910,7 +911,7 @@ AlterTableSpec:
 			Constraint: constraint,
 		}
 	}
-|	"DROP" ColumnKeywordOpt ColumnName
+|	"DROP" ColumnKeywordOpt ColumnName CascadeOpt
 	{
 		$$ = &ast.AlterTableSpec{
 			Tp: ast.AlterTableDropColumn,
@@ -1039,6 +1040,10 @@ KeyOrIndexOpt:
 ColumnKeywordOpt:
 	{}
 |	"COLUMN"
+
+CascadeOpt:
+    {}
+|   "CASCADE"
 
 ColumnPosition:
 	{
