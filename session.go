@@ -27,7 +27,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
 	"github.com/juju/errors"
 	"github.com/ngaut/pools"
 	"github.com/opentracing/opentracing-go"
@@ -55,6 +54,7 @@ import (
 	"github.com/pingcap/tidb/util/charset"
 	"github.com/pingcap/tidb/util/kvcache"
 	"github.com/pingcap/tipb/go-binlog"
+	log "github.com/sirupsen/logrus"
 	goctx "golang.org/x/net/context"
 )
 
@@ -201,6 +201,10 @@ func (s *session) SetSessionManager(sm util.SessionManager) {
 
 func (s *session) GetSessionManager() util.SessionManager {
 	return s.sessionManager
+}
+
+func (s *session) StoreQueryFeedback(feedback interface{}) {
+	s.statsCollector.StoreQueryFeedback(feedback)
 }
 
 type schemaLeaseChecker struct {
@@ -723,11 +727,16 @@ func (s *session) Execute(goCtx goctx.Context, sql string) (recordSets []ast.Rec
 			return nil, errors.Trace(err)
 		}
 	} else {
-		charset, collation := s.sessionVars.GetCharsetInfo()
+		err = s.loadCommonGlobalVariablesIfNeeded()
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+
+		charsetInfo, collation := s.sessionVars.GetCharsetInfo()
 
 		// Step1: Compile query string to abstract syntax trees(ASTs).
 		startTS := time.Now()
-		stmtNodes, err := s.ParseSQL(goCtx, sql, charset, collation)
+		stmtNodes, err := s.ParseSQL(goCtx, sql, charsetInfo, collation)
 		if err != nil {
 			log.Warnf("[%d] parse error:\n%v\n%s", connID, err, sql)
 			return nil, errors.Trace(err)
@@ -775,9 +784,15 @@ func (s *session) PrepareStmt(sql string) (stmtID uint32, paramCount int, fields
 		// We don't need to create a transaction for prepare statement, just get information schema will do.
 		s.sessionVars.TxnCtx.InfoSchema = domain.GetDomain(s).InfoSchema()
 	}
+	err = s.loadCommonGlobalVariablesIfNeeded()
+	if err != nil {
+		err = errors.Trace(err)
+		return
+	}
+
 	prepareExec := executor.NewPrepareExec(s, executor.GetInfoSchema(s), sql)
-	prepareExec.DoPrepare()
-	return prepareExec.ID, prepareExec.ParamCount, prepareExec.Fields, prepareExec.Err
+	err = prepareExec.DoPrepare()
+	return prepareExec.ID, prepareExec.ParamCount, prepareExec.Fields, errors.Trace(err)
 }
 
 // checkArgs makes sure all the arguments' types are known and can be handled.
@@ -832,6 +847,7 @@ func (s *session) ExecutePreparedStmt(goCtx goctx.Context, stmtID uint32, args .
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+
 	s.PrepareTxnCtx(goCtx)
 	st, err := executor.CompileExecutePreparedStmt(s, stmtID, args...)
 	if err != nil {
@@ -1033,6 +1049,11 @@ func BootstrapSession(store kv.Storage) (*domain.Domain, error) {
 	return dom, errors.Trace(err)
 }
 
+// GetDomain gets the associated domain for store.
+func GetDomain(store kv.Storage) (*domain.Domain, error) {
+	return domap.Get(store)
+}
+
 // runInBootstrapSession create a special session for boostrap to run.
 // If no bootstrap and storage is remote, we must use a little lease time to
 // bootstrap quickly, after bootstrapped, we will reset the lease time.
@@ -1149,13 +1170,13 @@ const loadCommonGlobalVarsSQL = "select HIGH_PRIORITY * from mysql.global_variab
 	variable.AutocommitVar + quoteCommaQuote +
 	variable.SQLModeVar + quoteCommaQuote +
 	variable.MaxAllowedPacket + quoteCommaQuote +
+	variable.TimeZone + quoteCommaQuote +
 	/* TiDB specific global variables: */
 	variable.TiDBSkipUTF8Check + quoteCommaQuote +
 	variable.TiDBIndexJoinBatchSize + quoteCommaQuote +
 	variable.TiDBIndexLookupSize + quoteCommaQuote +
 	variable.TiDBIndexLookupConcurrency + quoteCommaQuote +
 	variable.TiDBIndexSerialScanConcurrency + quoteCommaQuote +
-	variable.TiDBMaxRowCountForINLJ + quoteCommaQuote +
 	variable.TiDBDistSQLScanConcurrency + "')"
 
 // loadCommonGlobalVariablesIfNeeded loads and applies commonly used global variables for the session.
@@ -1210,8 +1231,8 @@ func (tf *txnFuture) wait() (kv.Transaction, error) {
 
 func (s *session) getTxnFuture(ctx goctx.Context) *txnFuture {
 	span, ctx := opentracing.StartSpanFromContext(ctx, "session.getTxnFuture")
-	oracle := s.store.GetOracle()
-	tsFuture := oracle.GetTimestampAsync(ctx)
+	oracleStore := s.store.GetOracle()
+	tsFuture := oracleStore.GetTimestampAsync(ctx)
 	return &txnFuture{tsFuture, s.store, span}
 }
 
@@ -1261,10 +1282,6 @@ func (s *session) ActivePendingTxn() error {
 	}
 	s.txn = txn
 	s.sessionVars.TxnCtx.StartTS = s.txn.StartTS()
-	err = s.loadCommonGlobalVariablesIfNeeded()
-	if err != nil {
-		return errors.Trace(err)
-	}
 	if s.sessionVars.Systems[variable.TxnIsolation] == ast.ReadCommitted {
 		txn.SetOption(kv.IsolationLevel, kv.RC)
 	}
@@ -1283,10 +1300,6 @@ func (s *session) InitTxnWithStartTS(startTS uint64) error {
 	s.txnFuture = nil
 	var err error
 	s.txn, err = s.store.BeginWithStartTS(startTS)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	err = s.loadCommonGlobalVariablesIfNeeded()
 	if err != nil {
 		return errors.Trace(err)
 	}

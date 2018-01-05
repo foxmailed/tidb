@@ -25,7 +25,6 @@ import (
 	"strings"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
 	"github.com/cznic/mathutil"
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/context"
@@ -33,6 +32,8 @@ import (
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tipb/go-tipb"
+	log "github.com/sirupsen/logrus"
 )
 
 const ( // GET_FORMAT first argument.
@@ -675,8 +676,8 @@ func (c *dateFormatFunctionClass) getFunction(ctx context.Context, args []Expres
 	// worst case: formatMask=%r%r%r...%r, each %r takes 11 characters
 	bf.tp.Flen = (args[1].GetType().Flen + 1) / 2 * 11
 	sig := &builtinDateFormatSig{bf}
+	sig.setPbCode(tipb.ScalarFuncSig_DateFormatSig)
 	return sig, nil
-
 }
 
 type builtinDateFormatSig struct {
@@ -1657,7 +1658,7 @@ func (c *sysDateFunctionClass) getFunction(ctx context.Context, args []Expressio
 	if err := c.verifyArgs(args); err != nil {
 		return nil, errors.Trace(err)
 	}
-	argTps := []types.EvalType{}
+	var argTps = make([]types.EvalType, 0)
 	if len(args) == 1 {
 		argTps = append(argTps, types.ETInt)
 	}
@@ -1687,7 +1688,9 @@ func (b *builtinSysDateWithFspSig) evalTime(row types.Row) (d types.Time, isNull
 		return types.Time{}, isNull, errors.Trace(err)
 	}
 
-	result, err := convertTimeToMysqlTime(time.Now(), int(fsp))
+	tz := b.ctx.GetSessionVars().GetTimeZone()
+	now := time.Now().In(tz)
+	result, err := convertTimeToMysqlTime(now, int(fsp))
 	if err != nil {
 		return types.Time{}, true, errors.Trace(err)
 	}
@@ -1701,7 +1704,9 @@ type builtinSysDateWithoutFspSig struct {
 // evalTime evals SYSDATE().
 // See https://dev.mysql.com/doc/refman/5.7/en/date-and-time-functions.html#function_sysdate
 func (b *builtinSysDateWithoutFspSig) evalTime(row types.Row) (d types.Time, isNull bool, err error) {
-	result, err := convertTimeToMysqlTime(time.Now(), 0)
+	tz := b.ctx.GetSessionVars().GetTimeZone()
+	now := time.Now().In(tz)
+	result, err := convertTimeToMysqlTime(now, 0)
 	if err != nil {
 		return types.Time{}, true, errors.Trace(err)
 	}
@@ -1729,7 +1734,8 @@ type builtinCurrentDateSig struct {
 // evalTime evals CURDATE().
 // See https://dev.mysql.com/doc/refman/5.7/en/date-and-time-functions.html#function_curdate
 func (b *builtinCurrentDateSig) evalTime(row types.Row) (d types.Time, isNull bool, err error) {
-	year, month, day := time.Now().Date()
+	tz := b.ctx.GetSessionVars().GetTimeZone()
+	year, month, day := time.Now().In(tz).Date()
 	result := types.Time{
 		Time: types.FromDate(year, int(month), day, 0, 0, 0, 0),
 		Type: mysql.TypeDate,
@@ -1777,7 +1783,9 @@ type builtinCurrentTime0ArgSig struct {
 }
 
 func (b *builtinCurrentTime0ArgSig) evalDuration(row types.Row) (types.Duration, bool, error) {
-	res, err := types.ParseDuration(time.Now().Format(types.TimeFormat), types.MinFsp)
+	tz := b.ctx.GetSessionVars().GetTimeZone()
+	dur := time.Now().In(tz).Format(types.TimeFormat)
+	res, err := types.ParseDuration(dur, types.MinFsp)
 	if err != nil {
 		return types.Duration{}, true, errors.Trace(err)
 	}
@@ -1794,7 +1802,9 @@ func (b *builtinCurrentTime1ArgSig) evalDuration(row types.Row) (types.Duration,
 	if err != nil {
 		return types.Duration{}, true, errors.Trace(err)
 	}
-	res, err := types.ParseDuration(time.Now().Format(types.TimeFSPFormat), int(fsp))
+	tz := b.ctx.GetSessionVars().GetTimeZone()
+	dur := time.Now().In(tz).Format(types.TimeFSPFormat)
+	res, err := types.ParseDuration(dur, int(fsp))
 	if err != nil {
 		return types.Duration{}, true, errors.Trace(err)
 	}

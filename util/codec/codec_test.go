@@ -754,17 +754,17 @@ func (s *testCodecSuite) TestJSON(c *C) {
 	datums := make([]types.Datum, 0, len(tbl))
 	for _, t := range tbl {
 		var d types.Datum
-		j, err := json.ParseFromString(t)
+		j, err := json.ParseBinaryFromString(t)
 		c.Assert(err, IsNil)
 		d.SetMysqlJSON(j)
 		datums = append(datums, d)
 	}
 
-	bytes := make([]byte, 0, 4096)
-	bytes, err := encode(bytes, datums, false, false)
+	buf := make([]byte, 0, 4096)
+	buf, err := encode(buf, datums, false, false)
 	c.Assert(err, IsNil)
 
-	datums1, err := Decode(bytes, 2)
+	datums1, err := Decode(buf, 2)
 	c.Assert(err, IsNil)
 
 	for i := range datums1 {
@@ -902,7 +902,7 @@ func (s *testCodecSuite) TestDecodeOneToChunk(c *C) {
 		{types.Enum{Name: "a", Value: 0}, &types.FieldType{Tp: mysql.TypeEnum, Elems: []string{"a"}}},
 		{types.Set{Name: "a", Value: 0}, &types.FieldType{Tp: mysql.TypeSet, Elems: []string{"a"}}},
 		{types.BinaryLiteral{100}, &types.FieldType{Tp: mysql.TypeBit, Flen: 8}},
-		{json.CreateJSON("abc"), types.NewFieldType(mysql.TypeJSON)},
+		{json.CreateBinary("abc"), types.NewFieldType(mysql.TypeJSON)},
 		{int64(1), types.NewFieldType(mysql.TypeYear)},
 	}
 
