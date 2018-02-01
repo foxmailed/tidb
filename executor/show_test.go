@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/juju/errors"
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb"
 	"github.com/pingcap/tidb/meta/autoid"
@@ -295,6 +296,26 @@ func (s *testSuite) TestShow(c *C) {
 			"  `e` bigint(20) DEFAULT NULL\n" +
 			") ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin",
 	}
+	for i, r := range row {
+		c.Check(r, Equals, expectedRow[i])
+	}
+
+	// Test get default collate for a specified charset.
+	tk.MustExec(`drop table if exists t`)
+	tk.MustExec(`create table t (a int) default charset=utf8mb4`)
+	tk.MustQuery(`show create table t`).Check(testutil.RowsWithSep("|",
+		"t CREATE TABLE `t` (\n"+
+			"  `a` int(11) DEFAULT NULL\n"+
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+	))
+
+	tk.MustExec(`drop table if exists t`)
+	tk.MustExec(`create table t (a int) default charset=abcdefg`)
+	tk.MustQuery(`show create table t`).Check(testutil.RowsWithSep("|",
+		"t CREATE TABLE `t` (\n"+
+			"  `a` int(11) DEFAULT NULL\n"+
+			") ENGINE=InnoDB DEFAULT CHARSET=abcdefg",
+	))
 }
 
 func (s *testSuite) TestShowVisibility(c *C) {
@@ -534,4 +555,30 @@ func (s *testSuite) TestCollation(c *C) {
 	c.Assert(fields[3].Column.Tp, Equals, mysql.TypeVarchar)
 	c.Assert(fields[4].Column.Tp, Equals, mysql.TypeVarchar)
 	c.Assert(fields[5].Column.Tp, Equals, mysql.TypeLonglong)
+}
+
+func (s *testSuite) TestShowTableStatus(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+
+	tk.MustExec("use test")
+	tk.MustExec(`drop table if exists t;`)
+	tk.MustExec(`create table t(a bigint);`)
+
+	// It's not easy to test the result contents because every time the test runs, "Create_time" changed.
+	tk.MustExec("show table status;")
+	rs, err := tk.Exec("show table status;")
+	c.Assert(errors.ErrorStack(err), Equals, "")
+	c.Assert(rs, NotNil)
+	rows, err := tidb.GetRows4Test(goctx.Background(), tk.Se, rs)
+	c.Assert(errors.ErrorStack(err), Equals, "")
+	err = rs.Close()
+	c.Assert(errors.ErrorStack(err), Equals, "")
+
+	for i := range rows {
+		row := rows[i]
+		c.Assert(row.GetString(0), Equals, "t")
+		c.Assert(row.GetString(1), Equals, "InnoDB")
+		c.Assert(row.GetInt64(2), Equals, int64(10))
+		c.Assert(row.GetString(3), Equals, "Compact")
+	}
 }

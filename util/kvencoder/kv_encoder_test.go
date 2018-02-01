@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/pingcap/tidb/meta/autoid"
 
@@ -26,6 +27,7 @@ import (
 	"github.com/pingcap/tidb"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/store/tikv"
 	"github.com/pingcap/tidb/structure"
 	"github.com/pingcap/tidb/tablecodec"
@@ -420,6 +422,41 @@ func (s *testKvEncoderSuite) TestRetryWithAllocator(c *C) {
 	}
 }
 
+func (s *testKvEncoderSuite) TestAllocatorRebase(c *C) {
+	store, dom, err := newStoreWithBootstrap()
+	c.Assert(err, IsNil)
+	defer store.Close()
+	defer dom.Close()
+
+	tk := testkit.NewTestKit(c, store)
+	tk.MustExec("use test")
+	alloc := NewAllocator()
+	var tableID int64 = 1
+	encoder, err := New("test", alloc)
+	err = alloc.Rebase(tableID, 100, false)
+	c.Assert(err, IsNil)
+	c.Assert(alloc.Base(), Equals, int64(100))
+
+	schemaSQL := `create table t(
+		id int auto_increment,
+		a char(10),
+		primary key(id))`
+	tk.MustExec(schemaSQL)
+	c.Assert(encoder.ExecDDLSQL(schemaSQL), IsNil)
+
+	sql := "insert into t(id, a) values(1000, 'test')"
+	encoder.Encode(sql, tableID)
+	c.Assert(alloc.Base(), Equals, int64(1000))
+
+	sql = "insert into t(a) values('test')"
+	encoder.Encode(sql, tableID)
+	c.Assert(alloc.Base(), Equals, int64(1001))
+
+	sql = "insert into t(id, a) values(2000, 'test')"
+	encoder.Encode(sql, tableID)
+	c.Assert(alloc.Base(), Equals, int64(2000))
+}
+
 func (s *testKvEncoderSuite) TestSimpleKeyEncode(c *C) {
 	encoder, err := New("test", nil)
 	c.Assert(err, IsNil)
@@ -445,12 +482,13 @@ func (s *testKvEncoderSuite) TestSimpleKeyEncode(c *C) {
 	handle := int64(1)
 	expectRecordKey := tablecodec.EncodeRecordKey(tablePrefix, handle)
 
+	sc := &stmtctx.StatementContext{TimeZone: time.Local}
 	indexPrefix := tablecodec.EncodeTableIndexPrefix(tableID, indexID)
 	expectIdxKey := make([]byte, 0)
 	expectIdxKey = append(expectIdxKey, []byte(indexPrefix)...)
-	expectIdxKey, err = codec.EncodeKey(expectIdxKey, types.NewDatum([]byte("a")))
+	expectIdxKey, err = codec.EncodeKey(sc, expectIdxKey, types.NewDatum([]byte("a")))
 	c.Assert(err, IsNil)
-	expectIdxKey, err = codec.EncodeKey(expectIdxKey, types.NewDatum(handle))
+	expectIdxKey, err = codec.EncodeKey(sc, expectIdxKey, types.NewDatum(handle))
 	c.Assert(err, IsNil)
 
 	for _, row := range kvPairs {
@@ -487,7 +525,7 @@ func (s *testKvEncoderSuite) TestSimpleKeyEncode(c *C) {
 	indexPrefix = tablecodec.EncodeTableIndexPrefix(tableID, indexID)
 	expectIdxKey = []byte{}
 	expectIdxKey = append(expectIdxKey, []byte(indexPrefix)...)
-	expectIdxKey, err = codec.EncodeKey(expectIdxKey, types.NewDatum([]byte("a")))
+	expectIdxKey, err = codec.EncodeKey(sc, expectIdxKey, types.NewDatum([]byte("a")))
 	c.Assert(err, IsNil)
 
 	for _, row := range kvPairs {

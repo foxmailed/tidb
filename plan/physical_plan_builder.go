@@ -17,7 +17,6 @@ import (
 	"math"
 
 	"github.com/juju/errors"
-	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
@@ -68,7 +67,7 @@ func getPropByOrderByItems(items []*ByItems) (*requiredProp, bool) {
 	return &requiredProp{cols: cols, desc: desc}, true
 }
 
-func (p *LogicalTableDual) convert2NewPhysicalPlan(prop *requiredProp) (task, error) {
+func (p *LogicalTableDual) convert2PhysicalPlan(prop *requiredProp) (task, error) {
 	if !prop.isEmpty() {
 		return invalidTask, nil
 	}
@@ -77,8 +76,8 @@ func (p *LogicalTableDual) convert2NewPhysicalPlan(prop *requiredProp) (task, er
 	return &rootTask{p: dual}, nil
 }
 
-// convert2NewPhysicalPlan implements LogicalPlan interface.
-func (p *baseLogicalPlan) convert2NewPhysicalPlan(prop *requiredProp) (t task, err error) {
+// convert2PhysicalPlan implements LogicalPlan interface.
+func (p *baseLogicalPlan) convert2PhysicalPlan(prop *requiredProp) (t task, err error) {
 	// Look up the task with this prop in the task map.
 	// It's used to reduce double counting.
 	t = p.getTask(prop)
@@ -102,9 +101,9 @@ func (p *baseLogicalPlan) convert2NewPhysicalPlan(prop *requiredProp) (t task, e
 }
 
 func (p *baseLogicalPlan) getBestTask(bestTask task, pp PhysicalPlan) (task, error) {
-	tasks := make([]task, 0, len(p.basePlan.children))
-	for i, child := range p.basePlan.children {
-		childTask, err := child.(LogicalPlan).convert2NewPhysicalPlan(pp.getChildReqProps(i))
+	tasks := make([]task, 0, len(p.children))
+	for i, child := range p.children {
+		childTask, err := child.convert2PhysicalPlan(pp.getChildReqProps(i))
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -170,9 +169,9 @@ func (ds *DataSource) tryToGetDualTask() (task, error) {
 	return nil, nil
 }
 
-// convert2NewPhysicalPlan implements the PhysicalPlan interface.
+// convert2PhysicalPlan implements the PhysicalPlan interface.
 // It will enumerate all the available indices and choose a plan with least cost.
-func (ds *DataSource) convert2NewPhysicalPlan(prop *requiredProp) (task, error) {
+func (ds *DataSource) convert2PhysicalPlan(prop *requiredProp) (task, error) {
 	// If ds is an inner plan in an IndexJoin, the IndexJoin will generate an inner plan by itself.
 	// So here we do nothing.
 	// TODO: Add a special prop to handle IndexJoin's inner plan.
@@ -259,7 +258,7 @@ func (ds *DataSource) forceToIndexScan(idx *model.IndexInfo, remainedConds []exp
 		Index:            idx,
 		dataSourceSchema: ds.schema,
 		Ranges:           ranger.FullNewRange(),
-		OutOfOrder:       true,
+		KeepOrder:        false,
 	}.init(ds.ctx)
 	is.filterCondition = remainedConds
 	is.stats = ds.stats
@@ -308,10 +307,11 @@ func (ds *DataSource) convertToIndexScan(prop *requiredProp, idx *model.IndexInf
 	sc := ds.ctx.GetSessionVars().StmtCtx
 	idxCols, colLengths := expression.IndexInfo2Cols(ds.Schema().Columns, idx)
 	is.Ranges = ranger.FullNewRange()
+	eqCount := 0
 	if len(ds.pushedDownConds) > 0 {
+		is.conditions = ds.pushedDownConds
 		if len(idxCols) > 0 {
-			is.AccessCondition, is.filterCondition = ranger.DetachIndexConditions(ds.pushedDownConds, idxCols, colLengths)
-			is.Ranges, err = ranger.BuildIndexRange(sc, idxCols, colLengths, is.AccessCondition)
+			is.Ranges, is.AccessCondition, is.filterCondition, eqCount, err = ranger.DetachCondAndBuildRangeForIndex(sc, ds.pushedDownConds, idxCols, colLengths)
 			if err != nil {
 				return nil, errors.Trace(err)
 			}
@@ -346,9 +346,7 @@ func (ds *DataSource) convertToIndexScan(prop *requiredProp, idx *model.IndexInf
 			if col.Name.L == prop.cols[0].ColName.L {
 				matchProperty = matchIndicesProp(idx.Columns[i:], prop.cols)
 				break
-			} else if i >= len(is.AccessCondition) {
-				break
-			} else if sf, ok := is.AccessCondition[i].(*expression.ScalarFunction); !ok || sf.FuncName.L != ast.EQ {
+			} else if i >= eqCount {
 				break
 			}
 		}
@@ -373,9 +371,9 @@ func (ds *DataSource) convertToIndexScan(prop *requiredProp, idx *model.IndexInf
 			cop.tablePlan.(*PhysicalTableScan).appendExtraHandleCol(ds)
 		}
 		cop.keepOrder = true
+		is.KeepOrder = true
 		is.addPushedDownSelection(cop, ds, prop.expectedCnt)
 	} else {
-		is.OutOfOrder = true
 		expectedCnt := math.MaxFloat64
 		if prop.isEmpty() {
 			expectedCnt = prop.expectedCnt
@@ -454,9 +452,11 @@ func matchIndicesProp(idxCols []*model.IndexColumn, propCols []*expression.Colum
 func splitIndexFilterConditions(conditions []expression.Expression, indexColumns []*model.IndexColumn,
 	table *model.TableInfo) (indexConds, tableConds []expression.Expression) {
 	var pkName model.CIStr
-	pkInfo := table.GetPkColInfo()
-	if pkInfo != nil {
-		pkName = pkInfo.Name
+	if table.PKIsHandle {
+		pkInfo := table.GetPkColInfo()
+		if pkInfo != nil {
+			pkName = pkInfo.Name
+		}
 	}
 	var indexConditions, tableConditions []expression.Expression
 	for _, cond := range conditions {
@@ -490,13 +490,19 @@ func checkIndexCondition(condition expression.Expression, indexColumns []*model.
 	return true
 }
 
-func (ds *DataSource) forceToTableScan() PhysicalPlan {
+func (ds *DataSource) forceToTableScan(pk *expression.Column) PhysicalPlan {
+	var ranges []*ranger.NewRange
+	if pk != nil {
+		ranges = ranger.FullIntNewRange(mysql.HasUnsignedFlag(pk.RetType.Flag))
+	} else {
+		ranges = ranger.FullIntNewRange(false)
+	}
 	ts := PhysicalTableScan{
 		Table:       ds.tableInfo,
 		Columns:     ds.Columns,
 		TableAsName: ds.TableAsName,
 		DBName:      ds.DBName,
-		Ranges:      ranger.FullIntRange(),
+		Ranges:      ranges,
 	}.init(ds.ctx)
 	ts.SetSchema(ds.schema)
 	ts.stats = ds.stats
@@ -525,7 +531,6 @@ func (ds *DataSource) convertToTableScan(prop *requiredProp) (task task, err err
 	}.init(ds.ctx)
 	ts.SetSchema(ds.schema)
 	sc := ds.ctx.GetSessionVars().StmtCtx
-	ts.Ranges = ranger.FullIntRange()
 	var pkCol *expression.Column
 	if ts.Table.PKIsHandle {
 		if pkColInfo := ts.Table.GetPkColInfo(); pkColInfo != nil {
@@ -535,12 +540,17 @@ func (ds *DataSource) convertToTableScan(prop *requiredProp) (task task, err err
 			}
 		}
 	}
+	if pkCol != nil {
+		ts.Ranges = ranger.FullIntNewRange(mysql.HasUnsignedFlag(pkCol.RetType.Flag))
+	} else {
+		ts.Ranges = ranger.FullIntNewRange(false)
+	}
 	statsTbl := ds.statisticTable
 	rowCount := float64(statsTbl.Count)
 	if len(ds.pushedDownConds) > 0 {
 		if pkCol != nil {
 			ts.AccessCondition, ts.filterCondition = ranger.DetachCondsForTableRange(ds.ctx, ds.pushedDownConds, pkCol)
-			ts.Ranges, err = ranger.BuildTableRange(ts.AccessCondition, sc)
+			ts.Ranges, err = ranger.BuildTableRange(ts.AccessCondition, sc, pkCol.RetType)
 			if err != nil {
 				return nil, errors.Trace(err)
 			}

@@ -28,23 +28,23 @@ type ActionType byte
 
 // List DDL actions.
 const (
-	ActionNone ActionType = iota
-	ActionCreateSchema
-	ActionDropSchema
-	ActionCreateTable
-	ActionDropTable
-	ActionAddColumn
-	ActionDropColumn
-	ActionAddIndex
-	ActionDropIndex
-	ActionAddForeignKey
-	ActionDropForeignKey
-	ActionTruncateTable
-	ActionModifyColumn
-	ActionRebaseAutoID
-	ActionRenameTable
-	ActionSetDefaultValue
-	ActionShardRowID
+	ActionNone            ActionType = 0
+	ActionCreateSchema    ActionType = 1
+	ActionDropSchema      ActionType = 2
+	ActionCreateTable     ActionType = 3
+	ActionDropTable       ActionType = 4
+	ActionAddColumn       ActionType = 5
+	ActionDropColumn      ActionType = 6
+	ActionAddIndex        ActionType = 7
+	ActionDropIndex       ActionType = 8
+	ActionAddForeignKey   ActionType = 9
+	ActionDropForeignKey  ActionType = 10
+	ActionTruncateTable   ActionType = 11
+	ActionModifyColumn    ActionType = 12
+	ActionRebaseAutoID    ActionType = 13
+	ActionRenameTable     ActionType = 14
+	ActionSetDefaultValue ActionType = 15
+	ActionShardRowID      ActionType = 16
 )
 
 func (action ActionType) String() string {
@@ -144,9 +144,25 @@ type Job struct {
 	Version int64 `json:"version"`
 }
 
-// startTime gets the job generation time.
-func (job *Job) startTime() time.Time {
-	t := int64(job.StartTS >> 18) // 18 is for the logical time.
+// FinishTableJob is called when a job is finished.
+// It updates the job's state information and adds tblInfo to the binlog.
+func (job *Job) FinishTableJob(jobState JobState, schemaState SchemaState, ver int64, tblInfo *TableInfo) {
+	job.State = jobState
+	job.SchemaState = schemaState
+	job.BinlogInfo.AddTableInfo(ver, tblInfo)
+}
+
+// FinishDBJob is called when a job is finished.
+// It updates the job's state information and adds dbInfo the binlog.
+func (job *Job) FinishDBJob(jobState JobState, schemaState SchemaState, ver int64, dbInfo *DBInfo) {
+	job.State = jobState
+	job.SchemaState = schemaState
+	job.BinlogInfo.AddDBInfo(ver, dbInfo)
+}
+
+// tsConvert2Time converts timestamp to time.
+func tsConvert2Time(ts uint64) time.Time {
+	t := int64(ts >> 18) // 18 is for the logical time.
 	return time.Unix(t/1e3, (t%1e3)*1e6)
 }
 
@@ -203,7 +219,7 @@ func (job *Job) DecodeArgs(args ...interface{}) error {
 func (job *Job) String() string {
 	rowCount := job.GetRowCount()
 	return fmt.Sprintf("ID:%d, Type:%s, State:%s, SchemaState:%s, SchemaID:%d, TableID:%d, RowCount:%d, ArgLen:%d, start time: %v",
-		job.ID, job.Type, job.State, job.SchemaState, job.SchemaID, job.TableID, rowCount, len(job.Args), job.startTime())
+		job.ID, job.Type, job.State, job.SchemaState, job.SchemaID, job.TableID, rowCount, len(job.Args), tsConvert2Time(job.StartTS))
 }
 
 // IsFinished returns whether job is finished or not.
@@ -247,20 +263,20 @@ type JobState byte
 
 // List job states.
 const (
-	JobStateNone JobState = iota
-	JobStateRunning
+	JobStateNone    JobState = 0
+	JobStateRunning JobState = 1
 	// When DDL encountered an unrecoverable error at reorganization state,
 	// some keys has been added already, we need to remove them.
 	// JobStateRollingback is the state to do the rolling back job.
-	JobStateRollingback
-	JobStateRollbackDone
-	JobStateDone
-	JobStateCancelled
+	JobStateRollingback  JobState = 2
+	JobStateRollbackDone JobState = 3
+	JobStateDone         JobState = 4
+	JobStateCancelled    JobState = 5
 	// JobStateSynced is used to mark the information about the completion of this job
 	// has been synchronized to all servers.
-	JobStateSynced
+	JobStateSynced JobState = 6
 	// JobStateCancelling is used to mark the DDL job is cancelled by the client, but the DDL work hasn't handle it.
-	JobStateCancelling
+	JobStateCancelling JobState = 7
 )
 
 // String implements fmt.Stringer interface.

@@ -533,6 +533,7 @@ import (
 	InsertIntoStmt			"INSERT INTO statement"
 	KillStmt			"Kill statement"
 	LoadDataStmt			"Load data statement"
+	LoadStatsStmt			"Load statistic statement"
 	LockTablesStmt			"Lock tables statement"
 	PreparedStmt			"PreparedStmt"
 	SavePointStmt "SavePointStmt"
@@ -547,7 +548,7 @@ import (
 	ShowStmt			"Show engines/databases/tables/columns/warnings/status statement"
 	Statement			"statement"
 	ExplainableStmt			"explainable statement"
-	TruncateTableStmt		"TRANSACTION TABLE statement"
+	TruncateTableStmt		"TRUNCATE TABLE statement"
 	UnlockTablesStmt		"Unlock tables statement"
 	UpdateStmt			"UPDATE statement"
 	UnionStmt			"Union select state ment"
@@ -3228,6 +3229,22 @@ FunctionCallKeyword:
 	{
 		$$ = &ast.FuncCallExpr{FnName:model.NewCIStr(ast.PasswordFunc), Args: $3.([]ast.ExprNode)}
 	}
+|	'{' Identifier stringLit '}'
+	{
+		// This is ODBC syntax.
+		// See: https://dev.mysql.com/doc/refman/5.7/en/date-and-time-literals.html
+		expr := ast.NewValueExpr($3)
+		tp := $2
+		if tp == "ts" {
+			$$ = &ast.FuncCallExpr{FnName: model.NewCIStr(ast.TimestampLiteral), Args: []ast.ExprNode{expr}}
+		} else if tp == "t" {
+			$$ = &ast.FuncCallExpr{FnName: model.NewCIStr(ast.TimeLiteral), Args: []ast.ExprNode{expr}}
+		} else if tp == "d" {
+			$$ = &ast.FuncCallExpr{FnName: model.NewCIStr(ast.DateLiteral), Args: []ast.ExprNode{expr}}
+		} else {
+			$$ = expr
+		}
+	}
 
 FunctionCallNonKeyword:
 	builtinCurTime '(' FuncDatetimePrecListOpt ')'
@@ -4374,7 +4391,7 @@ SubSelect:
 		parser.setLastSelectFieldText(s, endOffset)
 		src := parser.src
 		// See the implementation of yyParse function
-		s.SetText(src[yyS[yypt-1].offset-1:yyS[yypt].offset-1])
+		s.SetText(src[yyS[yypt-1].offset:yyS[yypt].offset])
 		$$ = &ast.SubqueryExpr{Query: s}
 	}
 |	'(' UnionStmt ')'
@@ -4382,7 +4399,7 @@ SubSelect:
 		s := $2.(*ast.UnionStmt)
 		src := parser.src
 		// See the implementation of yyParse function
-		s.SetText(src[yyS[yypt-1].offset-1:yyS[yypt].offset-1])
+		s.SetText(src[yyS[yypt-1].offset:yyS[yypt].offset])
 		$$ = &ast.SubqueryExpr{Query: s}
 	}
 
@@ -4528,7 +4545,6 @@ TransactionChar:
 		varAssigns := []*ast.VariableAssignment{}
 		expr := ast.NewValueExpr("0")
 		varAssigns = append(varAssigns, &ast.VariableAssignment{Name: "tx_read_only", Value: expr, IsSystem: true})
-		varAssigns = append(varAssigns, &ast.VariableAssignment{Name: "transaction_read_only", Value: expr, IsSystem: true})
 		$$ = varAssigns
 	}
 |	"READ" "ONLY"
@@ -4536,7 +4552,6 @@ TransactionChar:
 		varAssigns := []*ast.VariableAssignment{}
 		expr := ast.NewValueExpr("1")
 		varAssigns = append(varAssigns, &ast.VariableAssignment{Name: "tx_read_only", Value: expr, IsSystem: true})
-		varAssigns = append(varAssigns, &ast.VariableAssignment{Name: "transaction_read_only", Value: expr, IsSystem: true})
 		$$ = varAssigns
 	}
 
@@ -5135,6 +5150,7 @@ Statement:
 |	InsertIntoStmt
 |	KillStmt
 |	LoadDataStmt
+|	LoadStatsStmt
 |	PreparedStmt
 |	RollbackStmt
 |	RenameTableStmt
@@ -6446,6 +6462,16 @@ KillOrKillTiDB:
 |	"KILL" "TIDB"
 	{
 		$$ = true
+	}
+
+/*******************************************************************************************/
+
+LoadStatsStmt:
+	"LOAD" "STATS" stringLit
+	{
+		$$ = &ast.LoadStatsStmt{
+			Path:       $3,
+		}
 	}
 
 %%

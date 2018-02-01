@@ -36,6 +36,8 @@ import (
 	"github.com/pingcap/tidb/executor"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
+	"github.com/pingcap/tidb/metrics"
+	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/parser"
 	"github.com/pingcap/tidb/plan"
@@ -44,7 +46,6 @@ import (
 	"github.com/pingcap/tidb/sessionctx/binloginfo"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
-	"github.com/pingcap/tidb/sessionctx/varsutil"
 	"github.com/pingcap/tidb/statistics"
 	"github.com/pingcap/tidb/store/tikv/oracle"
 	"github.com/pingcap/tidb/terror"
@@ -83,6 +84,8 @@ type Session interface {
 	ShowProcess() util.ProcessInfo
 	// PrePareTxnCtx is exported for test.
 	PrepareTxnCtx(goctx.Context)
+	// FieldList returns fields list of a table.
+	FieldList(tableName string) (fields []*ast.ResultField, err error)
 }
 
 var (
@@ -112,11 +115,19 @@ func (h *StmtHistory) Add(stmtID uint32, st ast.Statement, stmtCtx *stmtctx.Stat
 	h.history = append(h.history, s)
 }
 
+// Count returns the count of the history.
+func (h *StmtHistory) Count() int {
+	return len(h.history)
+}
+
 type session struct {
 	// processInfo is used by ShowProcess(), and should be modified atomically.
 	processInfo atomic.Value
-	txn         kv.Transaction // current transaction
-	txnFuture   *txnFuture
+
+	// TODO: Make txnFuture into StmtTxn to optimize the txn representation, avoid
+	// the ugly code like if s.Transaction == nil || s.Transaction.Valid()
+	StmtTxn
+	txnFuture *txnFuture
 
 	mu struct {
 		sync.RWMutex
@@ -133,6 +144,14 @@ type session struct {
 	sessionManager util.SessionManager
 
 	statsCollector *statistics.SessionStatsCollector
+}
+
+func (s *session) getMembufCap() int {
+	if s.sessionVars.ImportingData {
+		return kv.ImportingTxnMembufCap
+	}
+
+	return kv.DefaultTxnMembufCap
 }
 
 func (s *session) cleanRetryInfo() {
@@ -185,9 +204,9 @@ func (s *session) SetCollation(coID int) error {
 		return errors.Trace(err)
 	}
 	for _, v := range variable.SetNamesVariables {
-		s.sessionVars.Systems[v] = cs
+		terror.Log(errors.Trace(s.sessionVars.SetSystemVar(v, cs)))
 	}
-	s.sessionVars.Systems[variable.CollationConnection] = co
+	terror.Log(errors.Trace(s.sessionVars.SetSystemVar(variable.CollationConnection, co)))
 	return nil
 }
 
@@ -205,6 +224,31 @@ func (s *session) GetSessionManager() util.SessionManager {
 
 func (s *session) StoreQueryFeedback(feedback interface{}) {
 	s.statsCollector.StoreQueryFeedback(feedback)
+}
+
+// FieldList returns fields list of a table.
+func (s *session) FieldList(tableName string) ([]*ast.ResultField, error) {
+	is := executor.GetInfoSchema(s)
+	dbName := model.NewCIStr(s.GetSessionVars().CurrentDB)
+	tName := model.NewCIStr(tableName)
+	table, err := is.TableByName(dbName, tName)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	cols := table.Cols()
+	fields := make([]*ast.ResultField, 0, len(cols))
+	for _, col := range table.Cols() {
+		rf := &ast.ResultField{
+			ColumnAsName: col.Name,
+			TableAsName:  tName,
+			DBName:       dbName,
+			Table:        table.Meta(),
+			Column:       col.ColumnInfo,
+		}
+		fields = append(fields, rf)
+	}
+	return fields, nil
 }
 
 type schemaLeaseChecker struct {
@@ -229,10 +273,10 @@ func (s *schemaLeaseChecker) Check(txnTS uint64) error {
 		case domain.ResultSucc:
 			return nil
 		case domain.ResultFail:
-			schemaLeaseErrorCounter.WithLabelValues("changed").Inc()
+			metrics.SchemaLeaseErrorCounter.WithLabelValues("changed").Inc()
 			return domain.ErrInfoSchemaChanged
 		case domain.ResultUnknown:
-			schemaLeaseErrorCounter.WithLabelValues("outdated").Inc()
+			metrics.SchemaLeaseErrorCounter.WithLabelValues("outdated").Inc()
 			time.Sleep(time.Duration(schemaOutOfDateRetryInterval))
 		}
 
@@ -241,11 +285,11 @@ func (s *schemaLeaseChecker) Check(txnTS uint64) error {
 }
 
 func (s *session) doCommit(ctx goctx.Context) error {
-	if s.txn == nil || !s.txn.Valid() {
+	if s.Transaction == nil || !s.Transaction.Valid() {
 		return nil
 	}
 	defer func() {
-		s.txn = nil
+		s.Transaction = nil
 		s.sessionVars.SetStatusFlag(mysql.ServerStatusInTrans, false)
 	}()
 	if s.sessionVars.BinlogClient != nil {
@@ -262,7 +306,7 @@ func (s *session) doCommit(ctx goctx.Context) error {
 				},
 				Client: s.sessionVars.BinlogClient.(binlog.PumpClient),
 			}
-			s.txn.SetOption(kv.BinlogInfo, info)
+			s.Transaction.SetOption(kv.BinlogInfo, info)
 		}
 	}
 
@@ -273,12 +317,12 @@ func (s *session) doCommit(ctx goctx.Context) error {
 		tableIDs = append(tableIDs, id)
 	}
 	// Set this option for 2 phase commit to validate schema lease.
-	s.txn.SetOption(kv.SchemaLeaseChecker, &schemaLeaseChecker{
+	s.Transaction.SetOption(kv.SchemaLeaseChecker, &schemaLeaseChecker{
 		SchemaValidator: domain.GetDomain(s).SchemaValidator,
 		schemaVer:       s.sessionVars.TxnCtx.SchemaVersion,
 		relatedTableIDs: tableIDs,
 	})
-	if err := s.txn.Commit(ctx); err != nil {
+	if err := s.Transaction.Commit(ctx); err != nil {
 		return errors.Trace(err)
 	}
 	return nil
@@ -286,13 +330,16 @@ func (s *session) doCommit(ctx goctx.Context) error {
 
 func (s *session) doCommitWithRetry(ctx goctx.Context) error {
 	var txnSize int
-	if s.txn != nil && s.txn.Valid() {
-		txnSize = s.txn.Size()
+	if s.Transaction != nil && s.Transaction.Valid() {
+		txnSize = s.Transaction.Size()
 	}
 	err := s.doCommit(ctx)
 	if err != nil {
-		if s.isRetryableError(err) {
-			log.Warnf("[%d] retryable error: %v, txn: %v", s.sessionVars.ConnectionID, err, s.txn)
+		// Don't retry in BatchInsert mode. As a counter-example, insert into t1 select * from t2,
+		// BatchInsert already commit the first batch 1000 rows, then it commit 1000-2000 and retry the statement,
+		// Finally t1 will have more data than t2, with no errors return to user!
+		if s.isRetryableError(err) && !s.sessionVars.BatchInsert {
+			log.Warnf("[%d] retryable error: %v, txn: %v", s.sessionVars.ConnectionID, err, s.Transaction)
 			// Transactions will retry 2 ~ commitRetryLimit times.
 			// We make larger transactions retry less times to prevent cluster resource outage.
 			txnSizeRate := float64(txnSize) / float64(kv.TxnTotalSizeLimit)
@@ -302,7 +349,7 @@ func (s *session) doCommitWithRetry(ctx goctx.Context) error {
 	}
 	s.cleanRetryInfo()
 	if err != nil {
-		log.Warnf("[%d] finished txn:%v, %v", s.sessionVars.ConnectionID, s.txn, err)
+		log.Warnf("[%d] finished txn:%v, %v", s.sessionVars.ConnectionID, s.Transaction, err)
 		return errors.Trace(err)
 	}
 	mapper := s.GetSessionVars().TxnCtx.TableDeltaMap
@@ -321,11 +368,11 @@ func (s *session) CommitTxn(ctx goctx.Context) error {
 	}
 
 	err := s.doCommitWithRetry(ctx)
-	label := "OK"
+	label := metrics.LblOK
 	if err != nil {
-		label = "Error"
+		label = metrics.LblError
 	}
-	transactionCounter.WithLabelValues(label).Inc()
+	metrics.TransactionCounter.WithLabelValues(label).Inc()
 	return errors.Trace(err)
 }
 
@@ -336,11 +383,12 @@ func (s *session) RollbackTxn(ctx goctx.Context) error {
 	}
 
 	var err error
-	if s.txn != nil && s.txn.Valid() {
-		err = s.txn.Rollback()
+	if s.Transaction != nil && s.Transaction.Valid() {
+		err = s.Transaction.Rollback()
+		metrics.TransactionCounter.WithLabelValues(metrics.LblRollback).Inc()
 	}
 	s.cleanRetryInfo()
-	s.txn = nil
+	s.Transaction = nil
 	s.txnFuture = nil
 	s.sessionVars.SetStatusFlag(mysql.ServerStatusInTrans, false)
 	return errors.Trace(err)
@@ -360,9 +408,9 @@ func (s *session) String() string {
 		"status":     sessVars.Status,
 		"strictMode": sessVars.StrictSQLMode,
 	}
-	if s.txn != nil {
+	if s.Transaction != nil {
 		// if txn is committed or rolled back, txn is nil.
-		data["txn"] = s.txn.String()
+		data["txn"] = s.Transaction.String()
 	}
 	if sessVars.SnapshotTS != 0 {
 		data["snapshotTS"] = sessVars.SnapshotTS
@@ -402,8 +450,9 @@ func (s *session) retry(goCtx goctx.Context, maxCnt int) error {
 	retryCnt := 0
 	defer func() {
 		s.sessionVars.RetryInfo.Retrying = false
-		sessionRetry.Observe(float64(retryCnt))
-		s.txn = nil
+		// retryCnt only increments on retryable error, so +1 here.
+		metrics.SessionRetry.Observe(float64(retryCnt + 1))
+		s.Transaction = nil
 		s.sessionVars.SetStatusFlag(mysql.ServerStatusInTrans, false)
 	}()
 
@@ -433,8 +482,10 @@ func (s *session) retry(goCtx goctx.Context, maxCnt int) error {
 			s.sessionVars.StmtCtx.ResetForRetry()
 			_, err = st.Exec(goCtx)
 			if err != nil {
+				s.StmtRollback()
 				break
 			}
+			terror.Log(s.StmtCommit())
 		}
 		if hook := ctx.Value("preCommitHook"); hook != nil {
 			// For testing purpose.
@@ -447,17 +498,19 @@ func (s *session) retry(goCtx goctx.Context, maxCnt int) error {
 			}
 		}
 		if !s.isRetryableError(err) {
-			log.Warnf("[%d] session:%v, err:%v", connID, s, err)
+			log.Warnf("[%d] session:%v, err:%v in retry", connID, s, err)
+			metrics.SessionRetryErrorCounter.WithLabelValues(metrics.LblUnretryable)
 			return errors.Trace(err)
 		}
 		retryCnt++
 		if retryCnt >= maxCnt {
 			log.Warnf("[%d] Retry reached max count %d", connID, retryCnt)
+			metrics.SessionRetryErrorCounter.WithLabelValues(metrics.LblReachMax)
 			return errors.Trace(err)
 		}
-		log.Warnf("[%d] retryable error: %v, txn: %v", connID, err, s.txn)
+		log.Warnf("[%d] retryable error: %v, txn: %v", connID, err, s.Transaction)
 		kv.BackOff(retryCnt)
-		s.txn = nil
+		s.Transaction = nil
 		s.sessionVars.SetStatusFlag(mysql.ServerStatusInTrans, false)
 	}
 	return err
@@ -491,6 +544,7 @@ func (s *session) ExecRestrictedSQL(ctx context.Context, sql string) ([]types.Ro
 	}
 	se := tmp.(*session)
 	defer s.sysSessionPool().Put(tmp)
+	metrics.SessionRestrictedSQLCounter.Inc()
 
 	recordSets, err := se.Execute(goCtx, sql)
 	if err != nil {
@@ -525,7 +579,7 @@ func createSessionFunc(store kv.Storage) pools.Factory {
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
-		err = varsutil.SetSessionSystemVar(se.sessionVars, variable.AutocommitVar, types.NewStringDatum("1"))
+		err = variable.SetSessionSystemVar(se.sessionVars, variable.AutocommitVar, types.NewStringDatum("1"))
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -541,7 +595,7 @@ func createSessionWithDomainFunc(store kv.Storage) func(*domain.Domain) (pools.R
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
-		err = varsutil.SetSessionSystemVar(se.sessionVars, variable.AutocommitVar, types.NewStringDatum("1"))
+		err = variable.SetSessionSystemVar(se.sessionVars, variable.AutocommitVar, types.NewStringDatum("1"))
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -670,8 +724,8 @@ func (s *session) executeStatement(goCtx goctx.Context, connID uint64, stmtNode 
 	} else {
 		s.ClearValue(context.LastExecuteDDL)
 	}
-
-	startTS := time.Now()
+	logStmt(stmtNode, s.sessionVars)
+	startTime := time.Now()
 	recordSet, err := runStmt(goCtx, s, stmt)
 	if err != nil {
 		if !kv.ErrKeyExists.Equal(err) {
@@ -679,12 +733,11 @@ func (s *session) executeStatement(goCtx goctx.Context, connID uint64, stmtNode 
 		}
 		return nil, errors.Trace(err)
 	}
-	sessionExecuteRunDuration.Observe(time.Since(startTS).Seconds())
+	metrics.SessionExecuteRunDuration.Observe(time.Since(startTime).Seconds())
 
 	if recordSet != nil {
 		recordSets = append(recordSets, recordSet)
 	}
-	logCrucialStmt(stmtNode, s.sessionVars.User)
 	return recordSets, nil
 }
 
@@ -741,7 +794,7 @@ func (s *session) Execute(goCtx goctx.Context, sql string) (recordSets []ast.Rec
 			log.Warnf("[%d] parse error:\n%v\n%s", connID, err, sql)
 			return nil, errors.Trace(err)
 		}
-		sessionExecuteParseDuration.Observe(time.Since(startTS).Seconds())
+		metrics.SessionExecuteParseDuration.Observe(time.Since(startTS).Seconds())
 
 		compiler := executor.Compiler{Ctx: s}
 		for _, stmtNode := range stmtNodes {
@@ -754,10 +807,9 @@ func (s *session) Execute(goCtx goctx.Context, sql string) (recordSets []ast.Rec
 			stmt, err := compiler.Compile(goCtx, stmtNode)
 			if err != nil {
 				log.Warnf("[%d] compile error:\n%v\n%s", connID, err, sql)
-				terror.Log(errors.Trace(s.RollbackTxn(goCtx)))
 				return nil, errors.Trace(err)
 			}
-			sessionExecuteCompileDuration.Observe(time.Since(startTS).Seconds())
+			metrics.SessionExecuteCompileDuration.Observe(time.Since(startTS).Seconds())
 
 			// Step3: Cache the physical plan if possible.
 			if plan.PlanCacheEnabled && stmt.Cacheable && len(stmtNodes) == 1 && !s.GetSessionVars().StmtCtx.HistogramsNotLoad() {
@@ -853,6 +905,7 @@ func (s *session) ExecutePreparedStmt(goCtx goctx.Context, stmtID uint32, args .
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+	logQuery(st.OriginText(), s.sessionVars)
 	r, err := runStmt(goCtx, s, st)
 	return r, errors.Trace(err)
 }
@@ -866,12 +919,176 @@ func (s *session) DropPreparedStmt(stmtID uint32) error {
 	return nil
 }
 
+// StmtTxn wraps kv.Transaction to provide a new kv.Transaction.
+// It holds all statement related modification in the buffer before flush to the txn,
+// so if execute statement meets error, the txn won't be made dirty.
+type StmtTxn struct {
+	kv.Transaction
+
+	buf          kv.MemBuffer
+	mutations    map[int64]*binlog.TableMutation
+	dirtyTableOP []dirtyTableOperation
+}
+
+// dirtyTableOperation represents an operation to dirtyTable, we log the operation
+// first and apply the operation log when statement commit.
+type dirtyTableOperation struct {
+	kind   int
+	tid    int64
+	handle int64
+	row    []types.Datum
+}
+
+// Get overrides the Transaction interface.
+func (st *StmtTxn) Get(k kv.Key) ([]byte, error) {
+	val, err := st.buf.Get(k)
+	if kv.IsErrNotFound(err) {
+		val, err = st.Transaction.Get(k)
+	}
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if len(val) == 0 {
+		return nil, kv.ErrNotExist
+	}
+	return val, nil
+}
+
+// Set overrides the Transaction interface.
+func (st *StmtTxn) Set(k kv.Key, v []byte) error {
+	return st.buf.Set(k, v)
+}
+
+// Delete overrides the Transaction interface.
+func (st *StmtTxn) Delete(k kv.Key) error {
+	return st.buf.Delete(k)
+}
+
+// Seek overrides the Transaction interface.
+func (st *StmtTxn) Seek(k kv.Key) (kv.Iterator, error) {
+	bufferIt, err := st.buf.Seek(k)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	retrieverIt, err := st.Transaction.Seek(k)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return kv.NewUnionIter(bufferIt, retrieverIt, false)
+}
+
+// SeekReverse overrides the Transaction interface.
+func (st *StmtTxn) SeekReverse(k kv.Key) (kv.Iterator, error) {
+	bufferIt, err := st.buf.SeekReverse(k)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	retrieverIt, err := st.Transaction.SeekReverse(k)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return kv.NewUnionIter(bufferIt, retrieverIt, true)
+}
+
+func (st *StmtTxn) cleanup() {
+	st.buf.Reset()
+	for key := range st.mutations {
+		delete(st.mutations, key)
+	}
+	if st.dirtyTableOP != nil {
+		st.dirtyTableOP = st.dirtyTableOP[:0]
+	}
+}
+
+// StmtCommit implements the context.Context interface.
+func (s *session) StmtCommit() error {
+	defer s.StmtTxn.cleanup()
+	st := &s.StmtTxn
+	err := kv.WalkMemBuffer(s.buf, func(k kv.Key, v []byte) error {
+		if len(v) == 0 {
+			return errors.Trace(st.Transaction.Delete(k))
+		}
+		return errors.Trace(st.Transaction.Set(k, v))
+	})
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	// Need to flush binlog.
+	for tableID, delta := range st.mutations {
+		mutation := getBinlogMutation(s, tableID)
+		mergeToMutation(mutation, delta)
+	}
+
+	if len(st.dirtyTableOP) > 0 {
+		dirtyDB := executor.GetDirtyDB(s)
+		for _, op := range st.dirtyTableOP {
+			mergeToDirtyDB(dirtyDB, op)
+		}
+	}
+	return nil
+}
+
+// StmtRollback implements the context.Context interface.
+func (s *session) StmtRollback() {
+	s.StmtTxn.cleanup()
+	return
+}
+
+// StmtGetMutation implements the context.Context interface.
+func (s *session) StmtGetMutation(tableID int64) *binlog.TableMutation {
+	st := &s.StmtTxn
+	if _, ok := st.mutations[tableID]; !ok {
+		st.mutations[tableID] = &binlog.TableMutation{TableId: tableID}
+	}
+	return st.mutations[tableID]
+}
+
+func (s *session) StmtAddDirtyTableOP(op int, tid int64, handle int64, row []types.Datum) {
+	s.StmtTxn.dirtyTableOP = append(s.StmtTxn.dirtyTableOP, dirtyTableOperation{op, tid, handle, row})
+}
+
+func getBinlogMutation(ctx context.Context, tableID int64) *binlog.TableMutation {
+	bin := binloginfo.GetPrewriteValue(ctx, true)
+	for i := range bin.Mutations {
+		if bin.Mutations[i].TableId == tableID {
+			return &bin.Mutations[i]
+		}
+	}
+	idx := len(bin.Mutations)
+	bin.Mutations = append(bin.Mutations, binlog.TableMutation{TableId: tableID})
+	return &bin.Mutations[idx]
+}
+
+func mergeToMutation(m1, m2 *binlog.TableMutation) {
+	m1.InsertedRows = append(m1.InsertedRows, m2.InsertedRows...)
+	m1.UpdatedRows = append(m1.UpdatedRows, m2.UpdatedRows...)
+	m1.DeletedIds = append(m1.DeletedIds, m2.DeletedIds...)
+	m1.DeletedPks = append(m1.DeletedPks, m2.DeletedPks...)
+	m1.DeletedRows = append(m1.DeletedRows, m2.DeletedRows...)
+	m1.Sequence = append(m1.Sequence, m2.Sequence...)
+}
+
+func mergeToDirtyDB(dirtyDB *executor.DirtyDB, op dirtyTableOperation) {
+	switch op.kind {
+	case executor.DirtyTableAddRow:
+		dirtyDB.AddRow(op.tid, op.handle, op.row)
+	case executor.DirtyTableDeleteRow:
+		dirtyDB.DeleteRow(op.tid, op.handle)
+	case executor.DirtyTableTruncate:
+		dirtyDB.TruncateTable(op.tid)
+	}
+}
+
 func (s *session) Txn() kv.Transaction {
-	return s.txn
+	if s.Transaction == nil {
+		return nil
+	}
+	return &s.StmtTxn
 }
 
 func (s *session) NewTxn() error {
-	if s.txn != nil && s.txn.Valid() {
+	if s.Transaction != nil && s.Transaction.Valid() {
 		goCtx := goctx.TODO()
 		err := s.CommitTxn(goCtx)
 		if err != nil {
@@ -882,7 +1099,8 @@ func (s *session) NewTxn() error {
 	if err != nil {
 		return errors.Trace(err)
 	}
-	s.txn = txn
+	txn.SetCap(s.getMembufCap())
+	s.Transaction = txn
 	s.sessionVars.TxnCtx.StartTS = txn.StartTS()
 	return nil
 }
@@ -1096,6 +1314,8 @@ func createSession(store kv.Storage) (*session, error) {
 	// session implements variable.GlobalVarAccessor. Bind it to ctx.
 	s.sessionVars.GlobalVarsAccessor = s
 	s.sessionVars.BinlogClient = binloginfo.GetPumpClient()
+	s.StmtTxn.buf = kv.NewMemDbBuffer(kv.DefaultTxnMembufCap)
+	s.StmtTxn.mutations = make(map[int64]*binlog.TableMutation)
 	return s, nil
 }
 
@@ -1116,15 +1336,19 @@ func createSessionWithDomain(store kv.Storage, dom *domain.Domain) (*session, er
 	domain.BindDomain(s, dom)
 	// session implements variable.GlobalVarAccessor. Bind it to ctx.
 	s.sessionVars.GlobalVarsAccessor = s
+	s.StmtTxn.buf = kv.NewMemDbBuffer(kv.DefaultTxnMembufCap)
+	s.StmtTxn.mutations = make(map[int64]*binlog.TableMutation)
 	return s, nil
 }
 
 const (
 	notBootstrapped         = 0
-	currentBootstrapVersion = 16
+	currentBootstrapVersion = 17
 )
 
 func getStoreBootstrapVersion(store kv.Storage) int64 {
+	storeBootstrappedLock.Lock()
+	defer storeBootstrappedLock.Unlock()
 	// check in memory
 	_, ok := storeBootstrapped[store.UUID()]
 	if ok {
@@ -1153,7 +1377,9 @@ func getStoreBootstrapVersion(store kv.Storage) int64 {
 }
 
 func finishBootstrap(store kv.Storage) {
+	storeBootstrappedLock.Lock()
 	storeBootstrapped[store.UUID()] = true
+	storeBootstrappedLock.Unlock()
 
 	err := kv.RunInNewTxn(store, true, func(txn kv.Transaction) error {
 		t := meta.NewMeta(txn)
@@ -1200,8 +1426,8 @@ func (s *session) loadCommonGlobalVariablesIfNeeded() error {
 	for _, row := range rows {
 		varName := row.GetString(0)
 		varVal := row.GetDatum(1, &fields[1].Column.FieldType)
-		if _, ok := vars.Systems[varName]; !ok {
-			err = varsutil.SetSessionSystemVar(s.sessionVars, varName, varVal)
+		if _, ok := vars.GetSystemVar(varName); !ok {
+			err = variable.SetSessionSystemVar(s.sessionVars, varName, varVal)
 			if err != nil {
 				return errors.Trace(err)
 			}
@@ -1239,7 +1465,7 @@ func (s *session) getTxnFuture(ctx goctx.Context) *txnFuture {
 // PrepareTxnCtx starts a goroutine to begin a transaction if needed, and creates a new transaction context.
 // It is called before we execute a sql query.
 func (s *session) PrepareTxnCtx(ctx goctx.Context) {
-	if s.txn != nil && s.txn.Valid() {
+	if s.Transaction != nil && s.Transaction.Valid() {
 		return
 	}
 	if s.txnFuture != nil {
@@ -1268,7 +1494,7 @@ func (s *session) RefreshTxnCtx(goCtx goctx.Context) error {
 
 // ActivePendingTxn implements Context.ActivePendingTxn interface.
 func (s *session) ActivePendingTxn() error {
-	if s.txn != nil && s.txn.Valid() {
+	if s.Transaction != nil && s.Transaction.Valid() {
 		return nil
 	}
 	if s.txnFuture == nil {
@@ -1276,13 +1502,16 @@ func (s *session) ActivePendingTxn() error {
 	}
 	future := s.txnFuture
 	s.txnFuture = nil
+
 	txn, err := future.wait()
 	if err != nil {
 		return errors.Trace(err)
 	}
-	s.txn = txn
-	s.sessionVars.TxnCtx.StartTS = s.txn.StartTS()
-	if s.sessionVars.Systems[variable.TxnIsolation] == ast.ReadCommitted {
+	txn.SetCap(s.getMembufCap())
+	s.Transaction = txn
+	s.sessionVars.TxnCtx.StartTS = s.Transaction.StartTS()
+	isoLevel, _ := s.sessionVars.GetSystemVar(variable.TxnIsolation)
+	if isoLevel == ast.ReadCommitted {
 		txn.SetOption(kv.IsolationLevel, kv.RC)
 	}
 	return nil
@@ -1290,16 +1519,22 @@ func (s *session) ActivePendingTxn() error {
 
 // InitTxnWithStartTS create a transaction with startTS.
 func (s *session) InitTxnWithStartTS(startTS uint64) error {
-	if s.txn != nil && s.txn.Valid() {
+	if s.Transaction != nil && s.Transaction.Valid() {
 		return nil
 	}
 	if s.txnFuture == nil {
 		return errors.New("transaction channel is not set")
 	}
+
 	// no need to get txn from txnFutureCh since txn should init with startTs
 	s.txnFuture = nil
 	var err error
-	s.txn, err = s.store.BeginWithStartTS(startTS)
+	s.Transaction, err = s.store.BeginWithStartTS(startTS)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	s.Transaction.SetCap(s.getMembufCap())
+	err = s.loadCommonGlobalVariablesIfNeeded()
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -1320,16 +1555,26 @@ func (s *session) ShowProcess() util.ProcessInfo {
 	return pi
 }
 
-// logCrucialStmt logs some crucial SQL including: CREATE USER/GRANT PRIVILEGE/CHANGE PASSWORD/DDL etc.
-func logCrucialStmt(node ast.StmtNode, user *auth.UserIdentity) {
+// logStmt logs some crucial SQL including: CREATE USER/GRANT PRIVILEGE/CHANGE PASSWORD/DDL etc and normal SQL
+// if variable.ProcessGeneralLog is set.
+func logStmt(node ast.StmtNode, vars *variable.SessionVars) {
 	switch stmt := node.(type) {
 	case *ast.CreateUserStmt, *ast.DropUserStmt, *ast.AlterUserStmt, *ast.SetPwdStmt, *ast.GrantStmt,
 		*ast.RevokeStmt, *ast.AlterTableStmt, *ast.CreateDatabaseStmt, *ast.CreateIndexStmt, *ast.CreateTableStmt,
 		*ast.DropDatabaseStmt, *ast.DropIndexStmt, *ast.DropTableStmt, *ast.RenameTableStmt, *ast.TruncateTableStmt:
+		user := vars.User
 		if ss, ok := node.(ast.SensitiveStmtNode); ok {
 			log.Infof("[CRUCIAL OPERATION] %s (by %s).", ss.SecureText(), user)
 		} else {
 			log.Infof("[CRUCIAL OPERATION] %s (by %s).", stmt.Text(), user)
 		}
+	default:
+		logQuery(node.Text(), vars)
+	}
+}
+
+func logQuery(query string, vars *variable.SessionVars) {
+	if atomic.LoadUint32(&variable.ProcessGeneralLog) != 0 && !vars.InRestrictedSQL {
+		log.Infof("[%d] %s", vars.ConnectionID, query)
 	}
 }

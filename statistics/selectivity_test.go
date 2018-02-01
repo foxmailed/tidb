@@ -18,6 +18,7 @@ import (
 	"os"
 	"runtime/pprof"
 	"testing"
+	"time"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb"
@@ -27,6 +28,7 @@ import (
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/plan"
+	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/statistics"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/codec"
@@ -64,6 +66,7 @@ func (s *testSelectivitySuite) generateIntDatum(dimension, num int) ([]types.Dat
 			ret[i] = types.NewIntDatum(int64(i))
 		}
 	} else {
+		sc := &stmtctx.StatementContext{TimeZone: time.Local}
 		// In this way, we can guarantee the datum is in order.
 		for i := 0; i < len; i++ {
 			data := make([]types.Datum, dimension)
@@ -72,7 +75,7 @@ func (s *testSelectivitySuite) generateIntDatum(dimension, num int) ([]types.Dat
 				data[dimension-k-1].SetInt64(int64(j % num))
 				j = j / num
 			}
-			bytes, err := codec.EncodeKey(nil, data...)
+			bytes, err := codec.EncodeKey(sc, nil, data...)
 			if err != nil {
 				return nil, err
 			}
@@ -183,12 +186,12 @@ func (s *testSelectivitySuite) TestSelectivity(c *C) {
 		c.Assert(err, IsNil, comment)
 		p, err := plan.BuildLogicalPlan(ctx, stmts[0], is)
 		c.Assert(err, IsNil, Commentf("error %v, for building plan, expr %s", err, tt.exprs))
-		ratio, err := statsTbl.Selectivity(ctx, p.Children()[0].(*plan.LogicalSelection).Conditions)
+		ratio, err := statsTbl.Selectivity(ctx, p.(plan.LogicalPlan).Children()[0].(*plan.LogicalSelection).Conditions)
 		c.Assert(err, IsNil, comment)
 		c.Assert(math.Abs(ratio-tt.selectivity) < eps, IsTrue, Commentf("for %s, needed: %v, got: %v", tt.exprs, tt.selectivity, ratio))
 
 		statsTbl.Count *= 10
-		ratio, err = statsTbl.Selectivity(ctx, p.Children()[0].(*plan.LogicalSelection).Conditions)
+		ratio, err = statsTbl.Selectivity(ctx, p.(plan.LogicalPlan).Children()[0].(*plan.LogicalSelection).Conditions)
 		c.Assert(err, IsNil, comment)
 		c.Assert(math.Abs(ratio-tt.selectivity) < eps, IsTrue, Commentf("for %s, needed: %v, got: %v", tt.exprs, tt.selectivity, ratio))
 		statsTbl.Count /= 10
@@ -223,7 +226,7 @@ func BenchmarkSelectivity(b *testing.B) {
 	b.Run("selectivity", func(b *testing.B) {
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			_, err := statsTbl.Selectivity(ctx, p.Children()[0].(*plan.LogicalSelection).Conditions)
+			_, err := statsTbl.Selectivity(ctx, p.(plan.LogicalPlan).Children()[0].(*plan.LogicalSelection).Conditions)
 			c.Assert(err, IsNil)
 		}
 		b.ReportAllocs()

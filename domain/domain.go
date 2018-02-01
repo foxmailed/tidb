@@ -15,6 +15,7 @@ package domain
 
 import (
 	"crypto/tls"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,12 +30,14 @@ import (
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
+	"github.com/pingcap/tidb/metrics"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/owner"
 	"github.com/pingcap/tidb/privilege/privileges"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/statistics"
 	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/tidb/util"
 	log "github.com/sirupsen/logrus"
 	goctx "golang.org/x/net/context"
 	"google.golang.org/grpc"
@@ -310,7 +313,9 @@ func (do *Domain) Reload() error {
 
 	lease := do.DDL().GetLease()
 	sub := time.Since(startTime)
-	if sub > lease && lease > 0 {
+	// Reload interval is lease / 2, if load schema time elapses more than this interval,
+	// some query maybe responded by ErrInfoSchemaExpired error.
+	if sub > (lease/2) && lease > 0 {
 		log.Warnf("[ddl] loading schema takes a long time %v", sub)
 	}
 
@@ -323,6 +328,7 @@ func (do *Domain) loadSchemaInLoop(lease time.Duration) {
 	// Use lease/2 here as recommend by paper.
 	ticker := time.NewTicker(lease / 2)
 	defer ticker.Stop()
+	defer recoverInDomain("loadSchemaInLoop", true)
 	syncer := do.ddl.SchemaSyncer()
 
 	for {
@@ -358,12 +364,9 @@ func (do *Domain) loadSchemaInLoop(lease time.Duration) {
 func (do *Domain) mustRestartSyncer() error {
 	ctx := goctx.Background()
 	syncer := do.ddl.SchemaSyncer()
-	timeout := 5 * time.Second
 
 	for {
-		childCtx, cancel := goctx.WithTimeout(ctx, timeout)
-		err := syncer.Restart(childCtx)
-		cancel()
+		err := syncer.Restart(ctx)
 		if err == nil {
 			return nil
 		}
@@ -529,6 +532,7 @@ func (do *Domain) LoadPrivilegeLoop(ctx context.Context) error {
 	}
 
 	go func() {
+		defer recoverInDomain("loadPrivilegeInLoop", false)
 		var count int
 		for {
 			ok := true
@@ -586,20 +590,38 @@ func (do *Domain) UpdateTableStatsLoop(ctx context.Context) error {
 	statsHandle := statistics.NewHandle(ctx, do.statsLease)
 	atomic.StorePointer(&do.statsHandle, unsafe.Pointer(statsHandle))
 	do.ddl.RegisterEventCh(statsHandle.DDLEventCh())
-	lease := do.statsLease
-	if lease <= 0 {
+	if do.statsLease <= 0 {
 		return nil
 	}
+	owner := do.newStatsOwner()
 	do.wg.Add(1)
-	go do.updateStatsWorker(ctx, lease)
+	go do.updateStatsWorker(ctx, owner)
 	if RunAutoAnalyze {
 		do.wg.Add(1)
-		go do.autoAnalyzeWorker(lease)
+		go do.autoAnalyzeWorker(owner)
 	}
 	return nil
 }
 
-func (do *Domain) updateStatsWorker(ctx context.Context, lease time.Duration) {
+func (do *Domain) newStatsOwner() owner.Manager {
+	id := do.ddl.OwnerManager().ID()
+	cancelCtx, cancelFunc := goctx.WithCancel(goctx.Background())
+	var statsOwner owner.Manager
+	if do.etcdClient == nil {
+		statsOwner = owner.NewMockManager(id, cancelFunc)
+	} else {
+		statsOwner = owner.NewOwnerManager(do.etcdClient, statistics.StatsPrompt, id, statistics.StatsOwnerKey, cancelFunc)
+	}
+	// TODO: Need to do something when err is not nil.
+	err := statsOwner.CampaignOwner(cancelCtx)
+	if err != nil {
+		log.Warnf("[stats] campaign owner fail:", errors.ErrorStack(err))
+	}
+	return statsOwner
+}
+
+func (do *Domain) updateStatsWorker(ctx context.Context, owner owner.Manager) {
+	lease := do.statsLease
 	deltaUpdateDuration := lease * 5
 	loadTicker := time.NewTicker(lease)
 	defer loadTicker.Stop()
@@ -607,6 +629,8 @@ func (do *Domain) updateStatsWorker(ctx context.Context, lease time.Duration) {
 	defer deltaUpdateTicker.Stop()
 	loadHistogramTicker := time.NewTicker(lease)
 	defer loadHistogramTicker.Stop()
+	gcStatsTicker := time.NewTicker(100 * lease)
+	defer gcStatsTicker.Stop()
 	statsHandle := do.StatsHandle()
 	t := time.Now()
 	err := statsHandle.InitStats(do.InfoSchema())
@@ -615,6 +639,7 @@ func (do *Domain) updateStatsWorker(ctx context.Context, lease time.Duration) {
 	} else {
 		log.Info("[stats] init stats info takes ", time.Now().Sub(t))
 	}
+	defer recoverInDomain("updateStatsWorker", false)
 	for {
 		select {
 		case <-loadTicker.C:
@@ -639,37 +664,36 @@ func (do *Domain) updateStatsWorker(ctx context.Context, lease time.Duration) {
 				}
 			}
 		case <-deltaUpdateTicker.C:
-			statsHandle.DumpStatsDeltaToKV()
+			err := statsHandle.DumpStatsDeltaToKV()
+			if err != nil {
+				log.Error("[stats] dump stats delta fail: ", errors.ErrorStack(err))
+			}
 		case <-loadHistogramTicker.C:
 			err := statsHandle.LoadNeededHistograms()
 			if err != nil {
 				log.Error("[stats] load histograms fail: ", errors.ErrorStack(err))
 			}
+		case <-gcStatsTicker.C:
+			if !owner.IsOwner() {
+				continue
+			}
+			err := statsHandle.GCStats(do.InfoSchema(), do.DDL().GetLease())
+			if err != nil {
+				log.Error("[stats] gc stats fail: ", errors.ErrorStack(err))
+			}
 		}
 	}
 }
 
-func (do *Domain) autoAnalyzeWorker(lease time.Duration) {
-	id := do.ddl.OwnerManager().ID()
-	cancelCtx, cancelFunc := goctx.WithCancel(goctx.Background())
-	var statsOwner owner.Manager
-	if do.etcdClient == nil {
-		statsOwner = owner.NewMockManager(id, cancelFunc)
-	} else {
-		statsOwner = owner.NewOwnerManager(do.etcdClient, statistics.StatsPrompt, id, statistics.StatsOwnerKey, cancelFunc)
-	}
-	// TODO: Need to do something when err is not nil.
-	err := statsOwner.CampaignOwner(cancelCtx)
-	if err != nil {
-		log.Warnf("[stats] campaign owner fail:", errors.ErrorStack(err))
-	}
+func (do *Domain) autoAnalyzeWorker(owner owner.Manager) {
 	statsHandle := do.StatsHandle()
-	analyzeTicker := time.NewTicker(lease)
+	analyzeTicker := time.NewTicker(do.statsLease)
 	defer analyzeTicker.Stop()
+	defer recoverInDomain("autoAnalyzeWorker", false)
 	for {
 		select {
 		case <-analyzeTicker.C:
-			if statsOwner.IsOwner() {
+			if owner.IsOwner() {
 				err := statsHandle.HandleAutoAnalyze(do.InfoSchema())
 				if err != nil {
 					log.Error("[stats] auto analyze fail:", errors.ErrorStack(err))
@@ -693,6 +717,21 @@ func (do *Domain) NotifyUpdatePrivilege(ctx context.Context) {
 		if err != nil {
 			log.Warn("notify update privilege failed:", err)
 		}
+	}
+}
+
+func recoverInDomain(funcName string, quit bool) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	buf := util.GetStack()
+	log.Errorf("%s, %v, %s", funcName, r, buf)
+	metrics.PanicCounter.WithLabelValues(metrics.LabelDomain).Inc()
+	if quit {
+		// Wait for metrics to be pushed.
+		time.Sleep(time.Second * 15)
+		os.Exit(1)
 	}
 }
 

@@ -14,7 +14,6 @@
 package executor
 
 import (
-	"math"
 	"strconv"
 	"time"
 
@@ -24,8 +23,8 @@ import (
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/model"
+	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/sessionctx/variable"
-	"github.com/pingcap/tidb/sessionctx/varsutil"
 	"github.com/pingcap/tidb/statistics"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/types"
@@ -49,7 +48,7 @@ const (
 	maxRegionSampleSize  = 1000
 	maxSketchSize        = 10000
 	maxBucketSize        = 256
-	defaultCMSketchDepth = 8
+	defaultCMSketchDepth = 5
 	defaultCMSketchWidth = 2048
 )
 
@@ -125,7 +124,7 @@ func (e *AnalyzeExec) run(goCtx goctx.Context) error {
 
 func getBuildStatsConcurrency(ctx context.Context) (int, error) {
 	sessionVars := ctx.GetSessionVars()
-	concurrency, err := varsutil.GetSessionSystemVar(sessionVars, variable.TiDBBuildStatsConcurrency)
+	concurrency, err := variable.GetSessionSystemVar(sessionVars, variable.TiDBBuildStatsConcurrency)
 	if err != nil {
 		return 0, errors.Trace(err)
 	}
@@ -188,7 +187,7 @@ type AnalyzeIndexExec struct {
 func (e *AnalyzeIndexExec) open() error {
 	idxRange := &ranger.NewRange{LowVal: []types.Datum{types.MinNotNullDatum()}, HighVal: []types.Datum{types.MaxValueDatum()}}
 	var builder requestBuilder
-	kvReq, err := builder.SetIndexRanges(e.tblInfo.ID, e.idxInfo.ID, []*ranger.NewRange{idxRange}).
+	kvReq, err := builder.SetIndexRanges(e.ctx.GetSessionVars().StmtCtx, e.tblInfo.ID, e.idxInfo.ID, []*ranger.NewRange{idxRange}).
 		SetAnalyzeRequest(e.analyzePB).
 		SetKeepOrder(true).
 		SetPriority(e.priority).
@@ -218,7 +217,7 @@ func (e *AnalyzeIndexExec) buildStats() (hist *statistics.Histogram, cms *statis
 	hist = &statistics.Histogram{}
 	cms = statistics.NewCMSketch(defaultCMSketchDepth, defaultCMSketchWidth)
 	for {
-		data, err := e.result.NextRaw()
+		data, err := e.result.NextRaw(goctx.TODO())
 		if err != nil {
 			return nil, nil, errors.Trace(err)
 		}
@@ -265,19 +264,45 @@ func analyzeColumnsPushdown(colExec *AnalyzeColumnsExec) statistics.AnalyzeResul
 
 // AnalyzeColumnsExec represents Analyze columns push down executor.
 type AnalyzeColumnsExec struct {
-	ctx         context.Context
-	tblInfo     *model.TableInfo
-	colsInfo    []*model.ColumnInfo
-	pkInfo      *model.ColumnInfo
-	concurrency int
-	priority    int
-	keepOrder   bool
-	analyzePB   *tipb.AnalyzeReq
-	result      distsql.SelectResult
+	ctx           context.Context
+	tblInfo       *model.TableInfo
+	colsInfo      []*model.ColumnInfo
+	pkInfo        *model.ColumnInfo
+	concurrency   int
+	priority      int
+	keepOrder     bool
+	analyzePB     *tipb.AnalyzeReq
+	resultHandler *tableResultHandler
 }
 
 func (e *AnalyzeColumnsExec) open() error {
-	ranges := []ranger.IntColumnRange{{LowVal: math.MinInt64, HighVal: math.MaxInt64}}
+	var ranges []*ranger.NewRange
+	if e.pkInfo != nil {
+		ranges = ranger.FullIntNewRange(mysql.HasUnsignedFlag(e.pkInfo.Flag))
+	} else {
+		ranges = ranger.FullIntNewRange(false)
+	}
+	e.resultHandler = &tableResultHandler{}
+	firstPartRanges, secondPartRanges := splitRanges(ranges, e.keepOrder)
+	firstResult, err := e.buildResp(firstPartRanges)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if len(secondPartRanges) == 0 {
+		e.resultHandler.open(nil, firstResult)
+		return nil
+	}
+	var secondResult distsql.SelectResult
+	secondResult, err = e.buildResp(secondPartRanges)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	e.resultHandler.open(firstResult, secondResult)
+
+	return nil
+}
+
+func (e *AnalyzeColumnsExec) buildResp(ranges []*ranger.NewRange) (distsql.SelectResult, error) {
 	var builder requestBuilder
 	kvReq, err := builder.SetTableRanges(e.tblInfo.ID, ranges).
 		SetAnalyzeRequest(e.analyzePB).
@@ -287,15 +312,15 @@ func (e *AnalyzeColumnsExec) open() error {
 	kvReq.IsolationLevel = kv.RC
 	kvReq.Concurrency = e.concurrency
 	if err != nil {
-		return errors.Trace(err)
+		return nil, errors.Trace(err)
 	}
 	goCtx := goctx.TODO()
-	e.result, err = distsql.Analyze(goCtx, e.ctx.GetClient(), kvReq)
+	result, err := distsql.Analyze(goCtx, e.ctx.GetClient(), kvReq)
 	if err != nil {
-		return errors.Trace(err)
+		return nil, errors.Trace(err)
 	}
-	e.result.Fetch(goCtx)
-	return nil
+	result.Fetch(goCtx)
+	return result, nil
 }
 
 func (e *AnalyzeColumnsExec) buildStats() (hists []*statistics.Histogram, cms []*statistics.CMSketch, err error) {
@@ -303,7 +328,7 @@ func (e *AnalyzeColumnsExec) buildStats() (hists []*statistics.Histogram, cms []
 		return nil, nil, errors.Trace(err)
 	}
 	defer func() {
-		if err1 := e.result.Close(); err1 != nil {
+		if err1 := e.resultHandler.Close(); err1 != nil {
 			hists = nil
 			cms = nil
 			err = errors.Trace(err1)
@@ -320,7 +345,7 @@ func (e *AnalyzeColumnsExec) buildStats() (hists []*statistics.Histogram, cms []
 		}
 	}
 	for {
-		data, err1 := e.result.NextRaw()
+		data, err1 := e.resultHandler.nextRaw(goctx.TODO())
 		if err1 != nil {
 			return nil, nil, errors.Trace(err1)
 		}
@@ -332,20 +357,21 @@ func (e *AnalyzeColumnsExec) buildStats() (hists []*statistics.Histogram, cms []
 		if err != nil {
 			return nil, nil, errors.Trace(err)
 		}
+		sc := e.ctx.GetSessionVars().StmtCtx
 		if e.pkInfo != nil {
-			pkHist, err = statistics.MergeHistograms(e.ctx.GetSessionVars().StmtCtx, pkHist, statistics.HistogramFromProto(resp.PkHist), maxBucketSize)
+			pkHist, err = statistics.MergeHistograms(sc, pkHist, statistics.HistogramFromProto(resp.PkHist), maxBucketSize)
 			if err != nil {
 				return nil, nil, errors.Trace(err)
 			}
 		}
 		for i, rc := range resp.Collectors {
-			collectors[i].MergeSampleCollector(statistics.SampleCollectorFromProto(rc))
+			collectors[i].MergeSampleCollector(sc, statistics.SampleCollectorFromProto(rc))
 		}
 	}
 	timeZone := e.ctx.GetSessionVars().GetTimeZone()
 	if e.pkInfo != nil {
 		pkHist.ID = e.pkInfo.ID
-		err := pkHist.DecodeTo(&e.pkInfo.FieldType, timeZone)
+		err = pkHist.DecodeTo(&e.pkInfo.FieldType, timeZone)
 		if err != nil {
 			return nil, nil, errors.Trace(err)
 		}

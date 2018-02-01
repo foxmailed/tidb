@@ -52,7 +52,7 @@ func (p *PhysicalIndexScan) ExplainInfo() string {
 			}
 		}
 	}
-	buffer.WriteString(fmt.Sprintf(", out of order:%v", p.OutOfOrder))
+	buffer.WriteString(fmt.Sprintf(", keep order:%v", p.KeepOrder))
 	if p.Desc {
 		buffer.WriteString(", desc")
 	}
@@ -197,7 +197,7 @@ func (p *PhysicalIndexJoin) ExplainInfo() string {
 // ExplainInfo implements PhysicalPlan interface.
 func (p *PhysicalHashJoin) ExplainInfo() string {
 	buffer := bytes.NewBufferString(p.JoinType.String())
-	buffer.WriteString(fmt.Sprintf(", small:%s", p.Children()[p.SmallChildIdx].ExplainID()))
+	buffer.WriteString(fmt.Sprintf(", inner:%s", p.Children()[p.InnerChildIdx].ExplainID()))
 	if len(p.EqualConditions) > 0 {
 		buffer.WriteString(fmt.Sprintf(", equal:%s", p.EqualConditions))
 	}

@@ -20,9 +20,11 @@ import (
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
+	"github.com/pingcap/tidb/metrics"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/sessionctx/binloginfo"
 	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/tidb/util"
 	log "github.com/sirupsen/logrus"
 	goctx "golang.org/x/net/context"
 )
@@ -34,9 +36,6 @@ var RunWorker = true
 // then wait or pull the job queue to handle a schema change job.
 func (d *ddl) onDDLWorker() {
 	defer d.wait.Done()
-	if !RunWorker {
-		return
-	}
 
 	// We use 4 * lease time to check owner's timeout, so here, we will update owner's status
 	// every 2 * lease time. If lease is 0, we will use default 1s.
@@ -45,7 +44,14 @@ func (d *ddl) onDDLWorker() {
 
 	ticker := time.NewTicker(checkTime)
 	defer ticker.Stop()
-
+	defer func() {
+		r := recover()
+		if r != nil {
+			buf := util.GetStack()
+			log.Errorf("ddlWorker %v %s", r, buf)
+			metrics.PanicCounter.WithLabelValues(metrics.LabelDDL).Inc()
+		}
+	}()
 	for {
 		select {
 		case <-ticker.C:

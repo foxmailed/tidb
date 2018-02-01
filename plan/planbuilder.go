@@ -188,6 +188,8 @@ func (b *planBuilder) build(node ast.Node) Plan {
 		return b.buildInsert(x)
 	case *ast.LoadDataStmt:
 		return b.buildLoadData(x)
+	case *ast.LoadStatsStmt:
+		return b.buildLoadStats(x)
 	case *ast.PrepareStmt:
 		return b.buildPrepare(x)
 	case *ast.SelectStmt:
@@ -387,7 +389,7 @@ func findIndexByName(indices []*model.IndexInfo, name model.CIStr) *model.IndexI
 	return nil
 }
 
-func (b *planBuilder) buildSelectLock(src Plan, lock ast.SelectLockType) *LogicalLock {
+func (b *planBuilder) buildSelectLock(src LogicalPlan, lock ast.SelectLockType) *LogicalLock {
 	selectLock := LogicalLock{Lock: lock}.init(b.ctx)
 	selectLock.SetChildren(src)
 	return selectLock
@@ -642,6 +644,7 @@ func (b *planBuilder) buildShow(show *ast.ShowStmt) Plan {
 			}
 			p.Conditions = append(p.Conditions, expr)
 		}
+		p.ResolveIndices()
 	}
 	return p
 }
@@ -934,7 +937,7 @@ func (b *planBuilder) buildInsert(insert *ast.InsertStmt) Plan {
 				return nil
 			}
 		}
-		insertPlan.SelectPlan, b.err = doOptimize(b.optFlag, selectPlan.(LogicalPlan), b.ctx)
+		insertPlan.SelectPlan, b.err = doOptimize(b.optFlag, selectPlan.(LogicalPlan))
 		if b.err != nil {
 			return nil
 		}
@@ -945,6 +948,7 @@ func (b *planBuilder) buildInsert(insert *ast.InsertStmt) Plan {
 	if b.err != nil {
 		return nil
 	}
+	insertPlan.ResolveIndices()
 	return insertPlan
 }
 
@@ -968,6 +972,11 @@ func (b *planBuilder) buildLoadData(ld *ast.LoadDataStmt) Plan {
 	mockTablePlan := LogicalTableDual{}.init(b.ctx)
 	mockTablePlan.SetSchema(schema)
 	p.GenCols = b.resolveGeneratedColumns(tableInPlan.Cols(), nil, mockTablePlan)
+	return p
+}
+
+func (b *planBuilder) buildLoadStats(ld *ast.LoadStatsStmt) Plan {
+	p := &LoadStats{Path: ld.Path}
 	return p
 }
 

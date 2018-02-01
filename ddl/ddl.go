@@ -306,10 +306,15 @@ func (d *ddl) Stop() error {
 
 func (d *ddl) start(ctx goctx.Context) {
 	d.quitCh = make(chan struct{})
-	err := d.ownerManager.CampaignOwner(ctx)
-	terror.Log(errors.Trace(err))
-	d.wait.Add(1)
-	go d.onDDLWorker()
+
+	// If RunWorker is true, we need campaign owner and do DDL job.
+	// Otherwise, we needn't do that.
+	if RunWorker {
+		err := d.ownerManager.CampaignOwner(ctx)
+		terror.Log(errors.Trace(err))
+		d.wait.Add(1)
+		go d.onDDLWorker()
+	}
 
 	// For every start, we will send a fake job to let worker
 	// check owner firstly and try to find whether a job exists and run.
@@ -459,7 +464,10 @@ func (d *ddl) doDDLJob(ctx context.Context, job *model.Job) error {
 			return nil
 		}
 
-		return errors.Trace(historyJob.Error)
+		if historyJob.Error != nil {
+			return errors.Trace(historyJob.Error)
+		}
+		panic("When the state is JobCancel, historyJob.Error should never be nil")
 	}
 }
 
